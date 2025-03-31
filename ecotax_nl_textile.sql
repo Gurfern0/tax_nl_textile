@@ -1,4 +1,4 @@
--- Object name : sap_ecotax_nl_textile
+-- Object name : ecotax_nl_textile
 
 WITH Data_t AS (
   SELECT 
