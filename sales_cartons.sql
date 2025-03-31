@@ -1,101 +1,128 @@
--- Advanced Cohort Analysis and Customer Lifetime Value Calculation
--- This query demonstrates complex window functions, CTEs, and advanced aggregations
+-- Object name : sap_ecotax_nl_textile
 
-WITH customer_cohorts AS (
-    -- Identify customer cohorts based on their first purchase
-    SELECT 
-        customer_id,
-        DATE_TRUNC(order_date, MONTH) as cohort_month,
-        DATE_TRUNC(first_order_date, MONTH) as first_purchase_month,
-        -- Calculate cohort age in months
-        DATE_DIFF(DATE_TRUNC(order_date, MONTH), 
-                 DATE_TRUNC(first_order_date, MONTH), 
-                 MONTH) as cohort_age
-    FROM orders o
-    JOIN customers c USING (customer_id)
-    WHERE status = 'completed'
-),
-
-cohort_metrics AS (
-    -- Calculate key metrics for each cohort
-    SELECT 
-        first_purchase_month,
-        cohort_age,
-        COUNT(DISTINCT customer_id) as active_customers,
-        SUM(total_amount) as total_revenue,
-        AVG(total_amount) as avg_order_value,
-        -- Calculate retention rate
-        COUNT(DISTINCT customer_id) / 
-        FIRST_VALUE(COUNT(DISTINCT customer_id)) 
-            OVER (PARTITION BY first_purchase_month 
-                  ORDER BY cohort_age) as retention_rate
-    FROM customer_cohorts cc
-    JOIN orders o USING (customer_id)
-    WHERE o.status = 'completed'
-    GROUP BY 1, 2
-),
-
-customer_lifetime_value AS (
-    -- Calculate customer lifetime value using RFM analysis
-    SELECT 
-        customer_id,
-        COUNT(DISTINCT order_id) as frequency,
-        SUM(total_amount) as monetary,
-        DATE_DIFF(CURRENT_TIMESTAMP(), 
-                 MAX(order_date), 
-                 DAY) as recency,
-        -- Calculate RFM score
-        CASE 
-            WHEN recency <= 30 THEN 5
-            WHEN recency <= 60 THEN 4
-            WHEN recency <= 90 THEN 3
-            WHEN recency <= 180 THEN 2
-            ELSE 1
-        END as recency_score,
-        CASE 
-            WHEN frequency >= 10 THEN 5
-            WHEN frequency >= 7 THEN 4
-            WHEN frequency >= 5 THEN 3
-            WHEN frequency >= 3 THEN 2
-            ELSE 1
-        END as frequency_score,
-        CASE 
-            WHEN monetary >= 1000 THEN 5
-            WHEN monetary >= 500 THEN 4
-            WHEN monetary >= 250 THEN 3
-            WHEN monetary >= 100 THEN 2
-            ELSE 1
-        END as monetary_score
-    FROM orders
-    WHERE status = 'completed'
-    GROUP BY 1
+WITH Data_t AS (
+  SELECT 
+    VBELN,
+    POSNR,
+    MATNR,
+    REGEXP_REPLACE(MATNR, '^0+', '') AS matnr_trm,
+    LFIMG,
+    SPART AS Division,
+    VGBEL,
+    CASE
+      WHEN PSTYV IN ('ZTAN', 'ZREN', 'ZRCA', 'RENN') THEN 'Carton'
+      WHEN PSTYV IN ('ZSL2', 'ZSLN', 'ZSE1', 'ZRSL', 'ZRSE', 'ZRS2', 'ZFR1') THEN 'SlsItem'
+      ELSE '-'
+    END AS ItemType,
+    ERDAT AS Order_date,
+    WERKS AS Warehouse
+  FROM `lips`
+  WHERE MANDT = '300' AND ERDAT BETWEEN "2019-01-01" AND CURRENT_DATE() 
+      AND WERKS IN ('2000', '2100') AND LFIMG > 0 
+      AND SPART IN ('01', '02', '03', '04', '05')
 )
 
--- Final results combining cohort analysis and customer value
-SELECT 
-    cm.first_purchase_month,
-    cm.cohort_age,
-    cm.active_customers,
-    cm.total_revenue,
-    cm.avg_order_value,
-    cm.retention_rate,
-    -- Add customer value metrics
-    AVG(clv.frequency) as avg_frequency,
-    AVG(clv.monetary) as avg_lifetime_value,
-    -- Calculate cohort health score
-    (cm.retention_rate * 0.4 + 
-     (cm.total_revenue / FIRST_VALUE(cm.total_revenue) 
-      OVER (PARTITION BY cm.first_purchase_month 
-            ORDER BY cm.cohort_age)) * 0.6) as cohort_health_score
-FROM cohort_metrics cm
-LEFT JOIN customer_lifetime_value clv 
-    ON cm.first_purchase_month = DATE_TRUNC(clv.first_order_date, MONTH)
-GROUP BY 1, 2, 3, 4, 5, 6
-ORDER BY 1, 2;
+, VBLEN_ AS (
+  SELECT
+    min(VBELN) AS min_VBELN,
+    max(VBELN) AS max_VBELN
+  FROM Data_t
+)
 
--- Performance Notes:
--- 1. This query uses window functions efficiently for cohort calculations
--- 2. CTEs help break down complex logic into manageable steps
--- 3. The query benefits from partitioning on order_date and customer_id
--- 4. Consider materializing the customer_lifetime_value CTE for frequent access
--- 5. Indexes on customer_id and order_date will improve JOIN performance 
+, likp AS (
+  SELECT 
+    VBELN,
+    SUBSTR(VTEXT, INSTR(VTEXT, '-') + 1) AS Delivery_type,
+    VKORG AS Sales_organization
+  FROM `likp`
+  LEFT JOIN `tvlkt`
+    ON likp.LFART = tvlkt.LFART AND tvlkt.SPRAS = 'E'
+  WHERE ERDAT >= "2019-01-01" AND ERDAT < CURRENT_DATE()
+      AND likp.LFART IN ('LF', 'ZF01', 'ZF02', 'ZKE')
+      AND VBELN BETWEEN (SELECT min_VBELN FROM VBLEN_) 
+        AND (SELECT max_VBELN FROM VBLEN_)
+)
+
+, d_1 AS (
+  SELECT 
+    Data_t.*,
+    Delivery_type,
+    Sales_organization
+  FROM Data_t
+  INNER JOIN likp 
+    ON Data_t.VBELN = likp.VBELN
+)
+
+, vbpa AS (
+  SELECT DISTINCT 
+    VBELN,
+    LAND1 AS Cus_Cntry
+  FROM `vbpa`
+  WHERE PARVW = 'WE' 
+    AND VBELN BETWEEN (SELECT min_VBELN FROM VBLEN_) 
+      AND (SELECT max_VBELN FROM VBLEN_)
+)
+
+, d_2 AS (
+  SELECT 
+    d_1.*,
+    Cus_Cntry
+  FROM d_1
+  INNER JOIN vbpa 
+    ON d_1.VBELN = vbpa.VBELN
+)
+
+, md_file AS (
+  SELECT
+    CountryCode AS Cus_Cntry,  
+    CountryNm AS Cus_CntryNm
+  FROM `excel_sheet.stg_sheet_countrycodes`  
+)
+
+, d_3 AS (
+  SELECT 
+    d_2.*,
+    Cus_CntryNm
+  FROM d_2
+  LEFT JOIN md_file
+    ON d_2.Cus_Cntry = md_file.Cus_Cntry
+)
+
+, nl_textile AS (
+  SELECT DISTINCT
+    SKU AS matnr_trm, 
+    Title AS product_lines,
+    epr_subjection,
+    CAST(REPLACE(Net_weight_kg, ',', '.') AS NUMERIC) AS Weight_per_unit_kg,
+    hs_code
+  FROM `excel_sheet.stg_sheet_textile_NL`   
+)
+
+, d_7 AS (
+  SELECT 
+    d_3.*,
+    nl_textile.* EXCEPT(matnr_trm)
+  FROM d_3
+  INNER JOIN nl_textile
+    ON d_3.matnr_trm = nl_textile.matnr_trm
+)
+
+  SELECT DISTINCT
+    order_date,
+    EXTRACT(YEAR FROM Order_date) AS year,
+    cus_cntry,
+    cus_cntryNm,
+    sales_organization,
+    delivery_type,
+    division,
+    warehouse,
+    matnr_trm AS sku,
+    product_lines,
+    epr_subjection,
+    hs_code,
+    lfimg,
+    vbeln,
+    weight_per_unit_kg,
+    SUBSTR(hs_code, 1, 2) AS code
+  FROM d_7
+  WHERE cus_cntry = 'NL'
